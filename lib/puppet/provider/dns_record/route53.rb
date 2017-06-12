@@ -1,9 +1,9 @@
-#
-# Author:: Jomes Turnbull <james@puppetlabs.com>
+
+# Author:: Seekingalpha DevOps <devops+puppet@seekingalpha.com>
 # Type Name:: dns_record
 # Provider:: route53
 #
-# Copyright 2011, Puppet Labs
+# Copyright 2017, Seeking Alpha inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,66 +19,152 @@
 #
 
 require 'pp'
-require 'nokogiri'
 
 module Route53
   module Connection
     def route53
-      @@zone ||= Fog::DNS.new({ :provider => "aws",
-                                :aws_access_key_id => @username,
-                                :aws_secret_access_key => @password } )
-   end
- end
+      @@dns ||= Fog::DNS.new({
+        :provider => 'aws',
+        :aws_access_key_id => @username,
+        :aws_secret_access_key => @password
+      })
+    end
+  end
 end
 
+
 Puppet::Type.type(:dns_record).provide(:route53) do
+  desc "Manage Route53 records."
 
   confine :feature => :fog
   include Route53::Connection
 
-  desc "Manage AWS Route 53 records."
+  mk_resource_methods
 
-  def create
-    @zone = route53.zones.get(resource[:zone_id])
-    @zone.records.all.each do |r|
-      if r.name == resource[:name]
-        Puppet.debug("Route53: Cannot modify records, must remove #{resource[:name]}.")
-        r.destroy
+  def self.instances(resources = nil)
+    if resources
+      resources.map do |res|
+        new({name:res[:name],
+             customername:res[:customername],
+             username:res[:username],
+             password:res[:password],
+             provider:'route53',
+             type:res[:type],
+             ttl:res[:ttl],
+             content:Array(res[:content]),
+             domain:res[:domain],
+             ensure:res[:ensure],
+             require:res[:require]
+        })
       end
     end
+  end
 
-    begin
-      Puppet.debug("Attempting to create record type #{resource[:type]} for #{resource[:name]} as #{resource[:content]}")
-      record = @zone.records.create( :name  => resource[:name],
-                                     :value => resource[:content],
-                                     :type  => resource[:type],
-                                     :ttl   => resource[:ttl] )
-      Puppet.info("Route53: Created #{resource[:type]} record for #{resource[:name]}.#{resource[:domain]}")
-    rescue Excon::Errors::UnprocessableEntity
-      output = Nokogiri::XML( e.response.body ).xpath( "//xmlns:Message" ).text
-      Puppet.info("Route53: #{output}")
+  def flush
+    @customername, @username, @password = resource[:customername], resource[:username], resource[:password]
+    publish_zone = false
+    Puppet.debug("Flushing zone #{resource[:zone_id]}")
+    zone = route53.zones.get(resource[:zone_id])
+    content_dup = resource[:content].dup
+    Puppet.debug("content_dup: #{content_dup}")
+    case resource[:ensure]
+    when :present
+      existing = begin
+                   zone.records.all({fqdn:resource[:name]})
+                 rescue Excon::Error::NotFound
+                   []
+                 end
+      Puppet.debug("PUPPET_DNS: EXISTING: #{existing}")
+
+      to_remove, existing = existing.partition do |r|
+        (!resource[:content].include?(r.rdata['address'])) &&
+          r.type == resource[:type] &&
+          r.name == resource[:name]
+      end
+
+      Puppet.debug("EXISTING-2: #{existing}")
+      Puppet.debug("TO_REMOVE: #{to_remove}")
+      to_remove.each do |r|
+        Puppet.debug("Removing: #{r.inspect}")
+        r.destroy
+        publish_zone = true
+      end
+      needs_update = false
+      existing.each do |r|
+        if r.ttl != resource[:ttl]
+          r.ttl = resource[:ttl]
+          needs_update = true
+        end
+        content_dup -= [r.rdata['address']]
+      end
+      if needs_update
+        Puppet.debug("Updating #{resource[:name]}")
+        # Calling 'save' applys changes on all DNS node records and 'publish's
+        # the zone. so it's enough to call save on the 1st record
+        existing[0].save(true) # replace
+        publish_zone = true
+      end
+      Puppet.debug("content_dup-2: #{content_dup}")
+      # The remaining records in content_dup are 'new' and should be created
+      if !content_dup.empty?
+        content_dup.each do |new_ip|
+          zone.records.new(
+            name:resource[:name],
+            type:resource[:type],
+            ttl:resource[:ttl],
+            value:new_ip,
+          ).save
+          publish_zone = true
+        end
+      end
+    when :absent
+      to_remove = zone.records.all({fqdn:resource[:name]}).select do |r|
+        resource[:content].include?(r.rdata['address']) &&
+          r.type == resource[:type] &&
+          # In case resource[:name] resolves to multiple records(e.g
+          # some.domain.com would resolve to (*.)some.domain.com)
+          # compare the record name to apply only on relevant record(s)
+          r.name == resource[:name]
+      end
+      Puppet.debug("Removing: #{resource[:name]}: #{to_remove}")
+      to_remove.each do |r|
+        r.destroy
+        publish_zone = true
+      end
+    else
+      Puppet.error(" Unknow ensure: #{resource[:ensure]}, #{resource}")
+      raise "Unknown ensure for dns_record"
     end
+    if publish_zone
+      Puppet.debug("Publishing zone: #{zone.domain}")
+      zone.publish
+    end
+  end
+
+  def create
+    @property_hash[:ensure] = :present
   end
 
   def exists?
-    @username, @password = resource[:username], resource[:password]
-    resource[:content] = resource[:content].is_a?(Array) ? resource[:content] : resource[:content].to_a
-    @zone = route53.zones.get(resource[:zone_id])
-    records = @zone.records.all
-    if records.detect { |r| r.name == resource[:name] and r.value == resource[:content] and r.ttl == resource[:ttl] }
-      return true
-    else
+    Puppet.debug("Checking if exists #{resource}")
+    @customername, @username, @password = resource[:customername], resource[:username], resource[:password]
+    zone = route53.zones.get(resource[:zone_id])
+    begin
+      existing = zone.records.all({fqdn:resource[:name]}).select do |r|
+        r.type == resource[:type] &&
+          # In case resource[:name] resolves to multiple records(e.g
+          # some.domain.com would resolve to (*.)some.domain.com)
+          # compare the record name to apply only on relevant record(s)
+          r.name == resource[:name]
+      end
+    rescue Excon::Error::NotFound
       return false
     end
+    Puppet.debug("EXISTING-3: #{existing}, content: #{resource[:content]}")
+    (resource[:content] - existing.map do |r| r.value end).empty?
   end
 
   def destroy
-    @zone = route53.zones.get(resource[:zone_id])
-    @zone.records.all.each do |r|
-      if ( r.name == resource[:name] ) and ( r.type == resource[:type] )
-        r.destroy
-        Puppet.info("Route53: destroyed #{resource[:type]} record for #{resource[:name]}.#{resource[:domain]}")
-      end
-    end
+    @property_hash[:ensure] = :absent
   end
 end
