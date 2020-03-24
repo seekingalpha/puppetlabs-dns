@@ -33,7 +33,7 @@ end
 
 Puppet::Type.type(:dns_record).provide(:route53) do
 
-  confine :feature => :fog
+  confine :feature => :'fog-aws'
   include Route53::Connection
 
   desc "Manage AWS Route 53 records."
